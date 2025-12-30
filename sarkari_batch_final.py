@@ -1,4 +1,3 @@
-
 import requests
 from bs4 import BeautifulSoup
 import re
@@ -7,18 +6,26 @@ import pymongo
 import certifi
 from datetime import datetime
 import os
+import google.generativeai as genai  
 
 # ===================== CONFIGURATION =====================
 LISTING_URL = "https://sarkariresult.com.cm/result/"
 
-# GitHub Actions se Secret uthayega.
+# 1. MongoDB Connection
 MONGO_URI = os.getenv("MONGO_URI") 
-
-# Safety: Agar env variable nahi mila (Local run ke liye), to error print karega
 if not MONGO_URI:
-    print("⚠️ Warning: MONGO_URI environment variable nahi mila.")
-    # Agar local test karna hai to niche wali line uncomment karein:
-    # MONGO_URI = "mongodb+srv://surajkannujiya517_db_user:GoIWSSzlnxRn23gB@cluster0.adwxc68.mongodb.net/sara?retryWrites=true&w=majority"
+    # Local Testing ke liye (GitHub par ye line ignore ho jayegi agar Secret set hai)
+    MONGO_URI = "mongodb+srv://surajkannujiya517_db_user:GoIWSSzlnxRn23gB@cluster0.adwxc68.mongodb.net/sara?retryWrites=true&w=majority"
+
+# 2. Google Gemini AI Key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") 
+
+# 3. AI Setup
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    print("⚠️ Warning: GEMINI_API_KEY not found. AI Rephrasing will be skipped.")
 
 DB_NAME = "sara"
 COLL_NAME = "records"
@@ -27,6 +34,39 @@ BATCH_LIMIT = 0  # 0 = Scrape ALL links
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
+
+# ===================== AI REPHRASER (SIMPLE ENGLISH) =====================
+def rephrase_content_with_ai(text, title):
+    """
+    Uses Google Gemini to rewrite the summary in Simple English.
+    """
+    if not GEMINI_API_KEY or not text or len(text) < 30:
+        return text
+
+    try:
+        # 🔥 SIMPLE ENGLISH PROMPT 🔥
+        prompt = f"""
+        Rewrite the following job recruitment summary in very simple and easy-to-understand English.
+        Target Audience: Indian students and job seekers who prefer simple language.
+
+        Rules:
+        1. Use short sentences and simple vocabulary.
+        2. CRITICAL: STRICTLY PRESERVE all Dates, Numbers, Fees, Age Limits, and Post Names. Do not change any facts.
+        3. Make the content unique (SEO friendly) but keep the meaning exactly the same.
+        4. Do not start with "Here is the summary". Just provide the rewriten text directly.
+
+        Context Title: {title}
+        Original Text: "{text}"
+        """
+        
+        response = model.generate_content(prompt)
+        if response.text:
+            return response.text.strip()
+        
+    except Exception as e:
+        return text # Fail hone par original text use karein
+    
+    return text
 
 # ===================== UTILS =====================
 def clean_text(text):
@@ -48,7 +88,7 @@ def dedup_items(items):
             out.append(i)
     return out
 
-# ===================== VALIDATOR =====================
+# ===================== VALIDATOR & CLASSIFIER =====================
 def validate_link(url):
     if not url: return False
     url = url.lower()
@@ -63,7 +103,6 @@ def validate_link(url):
         except: return False
     return True
 
-# ===================== CLASSIFIER =====================
 def classify_list_by_content(items):
     content_str = " ".join(items).lower()
     if "start date" in content_str or "last date" in content_str or "exam date" in content_str: return "Important Dates"
@@ -95,20 +134,29 @@ def scrape_single_page(url):
             "createdAt": datetime.now()
         }
 
-        # Short Info
+        # --- 1. Short Info Extraction ---
         full_text = container.get_text(" | ", strip=True)
         start_match = re.search(r'(Short Information|Short Details)\s*[:\-]', full_text, re.IGNORECASE)
         end_match = re.search(r'(Important Dates|Application Fee|Notification)', full_text, re.IGNORECASE)
+        
+        extracted_info = ""
         if start_match and end_match and end_match.start() > start_match.end():
-            record['shortInformation'] = remove_branding(full_text[start_match.end():end_match.start()]).replace("|", "").strip()
+            extracted_info = remove_branding(full_text[start_match.end():end_match.start()]).replace("|", "").strip()
         else:
              for p in container.find_all('p'):
                 t = clean_text(p.get_text())
                 if len(t) > 60 and "post date" not in t.lower() and "click here" not in t.lower():
-                    record['shortInformation'] = remove_branding(t)
+                    extracted_info = remove_branding(t)
                     break
+        
+        # 🔥 APPLY AI REPHRASING (SIMPLE ENGLISH) 🔥
+        if extracted_info:
+            if GEMINI_API_KEY:
+                record['shortInformation'] = rephrase_content_with_ai(extracted_info, clean_title)
+            else:
+                record['shortInformation'] = extracted_info
 
-        # List Scanner
+        # --- 2. List Scanner ---
         for ul in container.find_all("ul"):
             items = []
             for li in ul.find_all("li"):
@@ -129,7 +177,7 @@ def scrape_single_page(url):
             if not any(d['title'] == heading for d in record['data']):
                 record["data"].append({ "title": heading, "dataType": "list", "data": dedup_items(items) })
 
-        # Table Scanner
+        # --- 3. Table Scanner ---
         for table in container.find_all("table"):
             rows = table.find_all("tr")
             if not rows: continue
@@ -211,10 +259,10 @@ if __name__ == "__main__":
         exit()
 
     targets = links if BATCH_LIMIT == 0 else links[:BATCH_LIMIT]
-    print(f"🚀 Processing {len(targets)} pages... (Skip Duplicates Mode)\n")
+    print(f"🚀 Processing {len(targets)} pages... (Simple English Mode)\n")
 
     for link in targets:
-        # Step 1: Scrape Data
+        # Step 1: Scrape & Rephrase
         data = scrape_single_page(link)
         
         if data and data["data"]:
@@ -222,15 +270,13 @@ if __name__ == "__main__":
             existing_record = db[COLL_NAME].find_one({"title": data["title"]})
             
             if existing_record:
-                # Agar mil gaya, to SKIP karo
                 print(f"   ⏩ Exists (Skipped): {data['title'][:40]}...")
             else:
-                # Agar nahi mila, to INSERT karo
                 db[COLL_NAME].insert_one(data)
-                print(f"   ✅ Saved (New): {data['title'][:40]}...")
+                print(f"   ✅ Saved (Unique + Simple): {data['title'][:40]}...")
         else:
             print("⚠️ Skipped (Empty/Failed):", link)
         
-        time.sleep(1)
+        time.sleep(2) # Polite Delay for AI
 
     print("\n🏁 Process Completed!")
