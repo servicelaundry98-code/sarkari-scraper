@@ -28,5 +28,6 @@ jobs:
       - name: Run Scraper Script
         env:
           MONGO_URI: ${{ secrets.MONGO_URI }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python sarkari_batch_final.py
