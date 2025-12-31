@@ -6,19 +6,27 @@ import pymongo
 import certifi
 from datetime import datetime
 import os
-import google.generativeai as genai  
+import google.generativeai as genai
 
 # ===================== CONFIGURATION =====================
-LISTING_URL = "https://sarkariresult.com.cm/result/"
+# Define all categories and their URLs here
+CATEGORIES = [
+    {"url": "https://sarkariresult.com.cm/result/", "type": "Result"},
+    {"url": "https://sarkariresult.com.cm/latest-jobs/", "type": "Latest Job"},
+    {"url": "https://sarkariresult.com.cm/answer-key/", "type": "Answer Key"},
+    {"url": "https://sarkariresult.com.cm/admit-card/", "type": "Admit Card"},
+    {"url": "https://sarkariresult.com.cm/admission/", "type": "Admission"},
+    {"url": "https://sarkariresult.com.cm/syllabus/", "type": "Syllabus"}
+]
 
 # 1. MongoDB Connection
-MONGO_URI = os.getenv("MONGO_URI") 
+MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
-    # Local Testing ke liye (GitHub par ye line ignore ho jayegi agar Secret set hai)
+    # Local Testing ke liye
     MONGO_URI = "mongodb+srv://surajkannujiya517_db_user:GoIWSSzlnxRn23gB@cluster0.adwxc68.mongodb.net/sara?retryWrites=true&w=majority"
 
 # 2. Google Gemini AI Key
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # 3. AI Setup
 if GEMINI_API_KEY:
@@ -29,7 +37,7 @@ else:
 
 DB_NAME = "sara"
 COLL_NAME = "records"
-BATCH_LIMIT = 0  # 0 = Scrape ALL links
+BATCH_LIMIT = 0  # 0 = Scrape ALL links per category
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -114,7 +122,7 @@ def classify_list_by_content(items):
     return "Details"
 
 # ===================== SCRAPER =====================
-def scrape_single_page(url):
+def scrape_single_page(url, post_type):
     print(f"   ▶ Scraping: {url}...")
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
@@ -126,7 +134,7 @@ def scrape_single_page(url):
 
         record = {
             "title": clean_title,
-            "typeOfPost": "RESULT",
+            "typeOfPost": post_type, # 🔥 Dynamic Post Type
             "nameOfPost": clean_title,
             "postDate": datetime.now(),
             "shortInformation": "",
@@ -200,7 +208,7 @@ def scrape_single_page(url):
                             if validate_link(a_tag['href']):
                                 link_data.append({ "Link Name": name, "Link": f"<a href='{a_tag['href']}' target='_blank'>Click Here</a>" })
                 if link_data:
-                     record["data"].append({ "title": "Important Links", "dataType": "table", "columns": [{"name": "Link Name", "type": "text"}, {"name": "Link", "type": "html"}], "data": link_data })
+                      record["data"].append({ "title": "Important Links", "dataType": "table", "columns": [{"name": "Link Name", "type": "text"}, {"name": "Link", "type": "html"}], "data": link_data })
             else:
                 headers = [clean_text(th.get_text()) for th in rows[0].find_all(["th", "td"])]
                 if not headers: continue
@@ -253,30 +261,40 @@ if __name__ == "__main__":
     client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
     db = client[DB_NAME]
     
-    links = get_all_links(LISTING_URL)
-    if not links:
-        print("❌ No links found.")
-        exit()
+    # 🔥 LOOP THROUGH ALL CATEGORIES 🔥
+    for cat in CATEGORIES:
+        cat_url = cat["url"]
+        cat_type = cat["type"]
 
-    targets = links if BATCH_LIMIT == 0 else links[:BATCH_LIMIT]
-    print(f"🚀 Processing {len(targets)} pages... (Simple English Mode)\n")
+        print(f"\n🌍 ===========================================")
+        print(f"📂 Processing Category: {cat_type.upper()}")
+        print(f"🔗 URL: {cat_url}")
+        print(f"===========================================\n")
 
-    for link in targets:
-        # Step 1: Scrape & Rephrase
-        data = scrape_single_page(link)
-        
-        if data and data["data"]:
-            # Step 2: DUPLICATE CHECK
-            existing_record = db[COLL_NAME].find_one({"title": data["title"]})
+        links = get_all_links(cat_url)
+        if not links:
+            print(f"❌ No links found for {cat_type}. Skipping...")
+            continue
+
+        targets = links if BATCH_LIMIT == 0 else links[:BATCH_LIMIT]
+        print(f"🚀 Processing {len(targets)} pages for {cat_type}...\n")
+
+        for link in targets:
+            # Step 1: Scrape & Rephrase (Pass the correct cat_type)
+            data = scrape_single_page(link, cat_type)
             
-            if existing_record:
-                print(f"   ⏩ Exists (Skipped): {data['title'][:40]}...")
+            if data and data["data"]:
+                # Step 2: DUPLICATE CHECK
+                existing_record = db[COLL_NAME].find_one({"title": data["title"]})
+                
+                if existing_record:
+                    print(f"   ⏩ Exists (Skipped): {data['title'][:40]}...")
+                else:
+                    db[COLL_NAME].insert_one(data)
+                    print(f"   ✅ Saved ({cat_type}): {data['title'][:40]}...")
             else:
-                db[COLL_NAME].insert_one(data)
-                print(f"   ✅ Saved (Unique + Simple): {data['title'][:40]}...")
-        else:
-            print("⚠️ Skipped (Empty/Failed):", link)
-        
-        time.sleep(2) # Polite Delay for AI
+                print("⚠️ Skipped (Empty/Failed):", link)
+            
+            time.sleep(2) # Polite Delay
 
-    print("\n🏁 Process Completed!")
+    print("\n🏁 All Categories Processed Successfully!")
